@@ -1,0 +1,211 @@
+===================uboot重要路径===================
+
+主配置头文件，包含各项宏开关和定义
+include/configs/tiny4412.h
+
+通用的cpu初始化代码，同时也是uboot的入口，编译链接后位于uboot.bin最靠前的位置
+arch/arm/cpu/armv7/start.S
+
+SoC和板级支持代码集合, 包含上电初始化过程中重要的lowlevel_init.S
+board/samsung/tiny4412/
+
+arch/arm/lib/board.c uboot的c语言入口，入口函数为board_init_f()
+
+==============初始化函数调用过程==============
+arch/arm/cpu/armv7/start.S
+
+reset:
+	/*
+	 * set the cpu to SVC32 mode
+	 */
+	mrs	r0, cpsr
+	bic	r0, r0, #0x1f
+	orr	r0, r0, #0xd3
+	msr	cpsr,r0
+
+	将cpu设置为svc模式，并关闭cpu中的中断总开关
+
+	bl	cpu_init_crit
+
+cpu_init_crit:
+
+	bl cache_init
+
+	/*
+	 * Invalidate L1 I/D
+	 */
+	mov	r0, #0			@ set up for MCR
+	mcr	p15, 0, r0, c8, c7, 0	@ invalidate TLBs
+	mcr	p15, 0, r0, c7, c5, 0	@ invalidate icache
+
+	/*
+	 * disable MMU stuff and caches
+	 */
+	mrc	p15, 0, r0, c1, c0, 0
+	bic	r0, r0, #0x00002000	@ clear bits 13 (--V-)
+	bic	r0, r0, #0x00000007	@ clear bits 2:0 (-CAM)
+	orr	r0, r0, #0x00000002	@ set bit 1 (--A-) Align
+	orr	r0, r0, #0x00000800	@ set bit 12 (Z---) BTB
+	mcr	p15, 0, r0, c1, c0, 0
+
+	将mmu的缓冲TLB和cpu缓冲进行清理
+
+	/*
+	 * Jump to board specific initialization...
+	 * The Mask ROM will have already initialized
+	 * basic memory. Go here to bump up clock rate and handle
+	 * wake up conditions.
+	 */
+	mov	ip, lr			@ persevere link reg across call
+	bl	lowlevel_init		@ go setup pll,mux,memory
+	mov	lr, ip			@ restore link
+	mov	pc, lr			@ back to my caller
+
+	进入位于board/samsung/tiny4412/lowlevel_init.S的lowlevel_init函数
+
+lowlevel_init:
+
+	/* use iROM stack in bl2 */
+	ldr	sp, =0x02060000
+	push	{lr}
+
+	将栈指针sp设置在stepping stone中，并将lowlevel_init的返回地址压入栈中
+
+	bl	read_om
+
+	读取启动设备的跳线，获悉所选择的启动设备
+
+	/* when we already run in ram, we don't need to relocate U-Boot.
+	 * and actually, memory controller must be configured before U-Boot
+	 * is running in ram.
+	 */
+	ldr	r0, =0xff000fff
+	bic	r1, pc, r0		/* r0 <- current base addr of code */
+	ldr	r2, _TEXT_BASE	/* r1 <- original base addr in ram */
+	bic	r2, r2, r0		/* r0 <- current base addr of code */
+	cmp	r1, r2			/* compare r0, r1 */
+	beq	after_copy		/* r0 == r1 then skip sdram init and u-boot.bin loading */
+
+	判断当前代码运行在stepping stone中还是ddr内存中，如果已经运行于ddr内存中，则跳过时钟总线和内存初始化以及uboot.bin的拷贝操作
+
+	/* init system clock */
+	bl	system_clock_init
+
+	时钟总线初始化，位于board/samsung/tiny4412/clock_init_tiny4412.S
+
+	/* Memory initialize */
+	bl	mem_ctrl_asm_init
+
+	ddr内存初始化，位于board/samsung/tiny4412/mem_init_tiny4412.S
+
+	/* init uart for debug */
+	bl	uart_asm_init
+
+	串口初始化，就在当前文件lowlevel_init.S中
+
+	b	load_uboot
+
+	拷贝u-boot.bin到ddr内存中
+
+load_uboot:
+	ldr	r0, =INF_REG_BASE
+	ldr	r1, [r0, #INF_REG3_OFFSET]
+	cmp	r1, #BOOT_NAND
+	beq	nand_boot
+	cmp	r1, #BOOT_ONENAND
+	beq	onenand_boot
+	cmp	r1, #BOOT_MMCSD
+	beq	mmcsd_boot
+	cmp	r1, #BOOT_EMMC
+	beq	emmc_boot
+	cmp	r1, #BOOT_EMMC_4_4
+	beq	emmc_boot_4_4
+	cmp	r1, #BOOT_NOR
+	beq	nor_boot
+	cmp	r1, #BOOT_SEC_DEV
+	beq	mmcsd_boot
+
+	根据寄存器的值，获知所选择的启动设备，从该设备中读取u-boot.bin到ddr内存中
+
+	以sd卡启动为例
+
+mmcsd_boot:
+	bl	movi_uboot_copy
+
+	movi_uboot_copy位于arch/arm/cpu/armv7/exynos/irom_copy.c
+
+void movi_uboot_copy(void)
+{
+	SDMMC_ReadBlocks(MOVI_UBOOT_POS, MOVI_UBOOT_BLKCNT, CONFIG_PHY_UBOOT_BASE);
+}
+
+	利用irom留下的存储器读取函数的入口(见Android_Exynos4412_iROM_Secure_Booting_Guide_Ver.1.00.00.pdf手册P21)，来进行u-boot.bin的拷贝操作
+
+	完成u-boot.bin的拷贝操作后回到lowlevel_init.S
+
+	b	after_copy
+
+after_copy:
+
+	/* led (GPM4_0~3) on */
+	ldr	r0, =0x110002E0
+	ldr	r1, =0x0c
+	str	r1, [r0, #0x04]
+
+#ifdef CONFIG_ENABLE_MMU
+	bl	enable_mmu
+#endif
+
+	点灯，按需开启mmu
+
+	ldr	r0, _board_init_f
+	mov	pc, r0
+
+_board_init_f:
+	.word board_init_f
+
+	使用绝对地址跳转，跳转到位于arch/arm/lib/board.c中的board_init_f，这就是u-boot.bin的c语言入口
+
+	init_fnc_t **init_fnc_ptr;
+
+	for (init_fnc_ptr = init_sequence; *init_fnc_ptr; ++init_fnc_ptr) {
+		if ((*init_fnc_ptr)() != 0) {
+			hang();
+		}
+	}
+
+	循环遍历执行函数指针数组init_sequence[]中的所有函数指针，完成各项初始化操作。下面就是init_sequence数组的定义
+
+init_fnc_t *init_sequence[] = {
+#if defined(CONFIG_ARCH_CPU_INIT)
+	arch_cpu_init,		/* basic arch cpu dependent setup */
+#endif
+#if defined(CONFIG_BOARD_EARLY_INIT_F)
+	board_early_init_f,
+#endif
+	timer_init,		/* initialize timer */
+#ifdef CONFIG_FSL_ESDHC
+	get_clocks,
+#endif
+	env_init,		/* initialize environment */
+#if defined(CONFIG_S5P6450) && !defined(CONFIG_S5P6460_IP_TEST)
+	init_baudrate,		/* initialze baudrate settings */
+	serial_init,		/* serial communications setup */
+#endif
+	console_init_f,		/* stage 1 init of console */
+	display_banner,		/* say that we are here */
+#if defined(CONFIG_DISPLAY_CPUINFO)
+	print_cpuinfo,		/* display cpu info (and speed) */
+#endif
+#if defined(CONFIG_DISPLAY_BOARDINFO)
+	checkboard,		/* display board info */
+#endif
+#if defined(CONFIG_HARD_I2C) || defined(CONFIG_SOFT_I2C)
+	init_func_i2c,
+#endif
+	dram_init,		/* configure available RAM banks */
+#if defined(CONFIG_CMD_PCI) || defined(CONFIG_PCI)
+	arm_pci_init,
+#endif
+	NULL,
+};

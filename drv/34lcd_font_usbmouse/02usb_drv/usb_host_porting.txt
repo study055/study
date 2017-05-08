@@ -1,0 +1,293 @@
+在写USB驱动程序的时候意外发现默认状态下内核没有驱动S5PV210的USB HOST控制器，于是，我自己动手移植了一下S5PV210的USB HOST模块，S5PV210的USB HOST控制器跟S3C2440的有些不同，S5PV210同时支持EHCI和OHCI接口（两者的区别自己谷歌搜一下），这样，S5PV210在功能上就完全支持USB2.0接口了。
+
+Linux内核(以3.8.3为例)默认仅提供了ehci-s5p.c，但是提供了很多其他平台的ohci源码，因此，我们可以参考ohci-exynos.c来编写自己的ohci-s5p.c，然后参考ehci-s5p.c的代码组织方式添加到内核就可以了。下面废话少说，直接进入正题，开始USB HOST的EHCI和OHCI移植。
+一 编写自己的ohci-s5p.c
+
+我们以drivers/usb/host/ohci-exynos.c为模板，修改以适合我们的S5P平台。
+
+（1）拷贝ohci-exynos.c为ohci-s5p.c
+
+（2）替换所有的exynos为s5p
+
+（3）由于有些地方是exynos4，所以，还需要将s5p4替换为s5p
+
+ (4)找到usbhost
+ 全部替换成usb-host
+
+（5）如果是3.4版本的内核不需要修改头文件，但是3.8.3内核对文件结构作了调整，还是将ohci-exynos.h头文件改为：
+
+#include <linux/platform_data/usb-ohci-s5p.h>
+
+二 修改drivers/usb/host目录下的相关文件
+
+（1）打开ohci-hcd.c文件，找到ohci-exynos，然后再其前面添加S5P平台支持，修改后如下：
+
+#ifdef CONFIG_USB_OHCI_S5P
+#include "ohci-s5p.c"
+#define S5P_PLATFORM_DRIVER     s5p_ohci_driver
+#endif
+
+#ifdef CONFIG_USB_OHCI_EXYNOS
+#include "ohci-exynos.c"
+#define EXYNOS_PLATFORM_DRIVER     exynos_ohci_driver
+#endif
+
+ (2) 找到!defined(EXYNOS_PLATFORM_DRIVER) &&
+ 在后面加上
+ !defined(S5P_PLATFORM_DRIVER) && \
+
+ (3)找到#ifdef EXYNOS_PLATFORM_DRIVER
+ 在后面加上
+ #ifdef S5P_PLATFORM_DRIVER
+	retval = platform_driver_register(&S5P_PLATFORM_DRIVER);
+	if (retval < 0)
+		goto error_s5p;
+#endif
+
+ （4）找到两处
+ #ifdef EXYNOS_PLATFORM_DRIVER
+	platform_driver_unregister(&EXYNOS_PLATFORM_DRIVER);
+ error_exynos:
+#endif
+在前面加上
+#ifdef S5P_PLATFORM_DRIVER
+	platform_driver_unregister(&S5P_PLATFORM_DRIVER);
+ error_s5p:
+#endif
+ （5）找到
+ #ifdef EXYNOS_PLATFORM_DRIVER
+	platform_driver_unregister(&EXYNOS_PLATFORM_DRIVER);
+#endif
+在前面加上
+#ifdef S5P_PLATFORM_DRIVER
+	platform_driver_unregister(&S5P_PLATFORM_DRIVER);
+#endif
+
+（4）打开Kconfig文件，在config USB_OHCI_EXYNOS前面添加S5P配置支持，修改后如下：
+
+config USB_OHCI_S5P
+boolean "S5P OHCI support"
+depends on USB_OHCI_HCD && PLAT_S5P
+help
+Enable support for the S5P SOC's on-chip OHCI controller.
+
+config USB_OHCI_EXYNOS
+boolean "OHCI support for Samsung EXYNOS SoC Series"
+depends on USB_OHCI_HCD && ARCH_EXYNOS
+help
+Enable support for the Samsung Exynos SOC's on-chip OHCI controller.
+
+三 编写usb-ohci-s5p.h头文件
+
+（1）切换目录到include/linux/platform_data/，然后拷贝usb-ohci-exynos.h到usb-ohci-s5p.h。
+
+（2）打开usb-ohci-s5p.h，将所有的exynos4替换为s5p。
+
+（3）将EXYNOS替换为S5P。
+
+ (4) 添加
+ extern struct platform_device s5p_device_ohci;
+
+完成这三步，ohci的驱动就已经做好了，但是还需要添加平台支持。
+四 配置平台支持
+
+（1）切换到目录arch/arm/plat-samsung，然后打开devs.c文件
+
+（2）在CONFIG_S5P_DEV_USB_EHCI模块后面添加如下内容：
+
+#ifdef CONFIG_S5P_DEV_USB_OHCI
+static struct resource s5p_ohci_resource[] = {
+	[0] = DEFINE_RES_MEM(0xEC300000, SZ_256),
+	[1] = DEFINE_RES_IRQ(S5P_IRQ_VIC1(23)),
+};
+
+struct platform_device s5p_device_ohci = {
+	.name       = "s5p-ohci",
+	.id     = -1,
+	.num_resources  = ARRAY_SIZE(s5p_ohci_resource),
+	.resource   = s5p_ohci_resource,
+	.dev        = {
+		.dma_mask       = &samsung_device_dma_mask,
+		.coherent_dma_mask  = DMA_BIT_MASK(32),
+	}
+};
+
+void __init s5p_ohci_set_platdata(struct s5p_ohci_platdata *pd)
+{
+	struct s5p_ohci_platdata *npd;
+
+	npd = s3c_set_platdata(pd, sizeof(struct s5p_ohci_platdata),
+			&s5p_device_ohci);
+
+	if (!npd->phy_init)
+		npd->phy_init = s5p_usb_phy_init;
+	if (!npd->phy_exit)
+		npd->phy_exit = s5p_usb_phy_exit;
+}
+#endif /* CONFIG_S5P_DEV_USB_OHCI */
+
+（2）添加ohci的头文件
+
+#include <linux/platform_data/usb-ohci-s5p.h>
+
+（3）打开Kconfig文件，在S5P_DEV_USB_EHCI模块后面添加OHCI支持，修改后如下
+
+config S5P_DEV_USB_EHCI
+	bool
+	help
+	  Compile in platform device definition for USB EHCI
+
+config S5P_DEV_USB_OHCI
+	bool
+	help
+	  Compile in platform device definition for USB OHCI
+
+（4）切换到arch/arm/mach-s5pv210目录，打开mach-smdkv210.c，在smdkv210_devices的定义中添加ehci和ohci设备，如下：
+
+#ifdef CONFIG_S5P_DEV_USB_EHCI
+	&s5p_device_ehci,
+#endif
+#ifdef CONFIG_S5P_DEV_USB_OHCI
+	&s5p_device_ohci,
+#endif
+
+	然后定义platform_data文件，内容如下：
+
+#ifdef CONFIG_S5P_DEV_USB_EHCI
+	static struct s5p_ehci_platdata s5p_ehci_platdata;
+#endif
+#ifdef CONFIG_S5P_DEV_USB_OHCI
+	static struct s5p_ohci_platdata s5p_ohci_platdata;
+#endif
+
+	最后，设置platform_data，在smdkv210_machine_init函数中添加如下内容：
+
+#ifdef CONFIG_S5P_DEV_USB_EHCI
+	s5p_ehci_set_platdata(&s5p_ehci_platdata);
+#endif
+#ifdef CONFIG_S5P_DEV_USB_OHCI
+	s5p_ohci_set_platdata(&s5p_ohci_platdata);
+#endif
+
+添加ohci的头文件
+#include <linux/platform_data/usb-ohci-s5p.h>
+
+	这样，就将平台设备注册给内核了。
+
+五 修改setup-usb-phy.c文件
+
+3.4版本开始，内核中自带的setup-usb-s5p.c文件就存在问题，需要修改才能支持S5PV210芯片。
+
+切换到目录arch/arm/mach-s5pv210，将setup-usb-s5p.c文件中的内容替换成下面的代码：
+
+#include <linux/platform_device.h>
+#include <linux/clk.h>
+#include <linux/err.h>
+#include <linux/io.h>
+#include <linux/delay.h>
+#include <mach/regs-clock.h>
+#include <mach/gpio.h>
+#include <mach/regs-sys.h>
+#include <plat/regs-usb-hsotg-phy.h>
+#include <plat/usb-phy.h>
+#include <plat/clock.h>
+#include <plat/gpio-cfg.h>
+
+int s5p_usb_phy_init(struct platform_device *pdev, int type)
+{
+	int err;
+	struct clk *otg_clk;
+
+	if (type != S5P_USB_PHY_HOST)
+		return -EINVAL;
+
+	otg_clk = clk_get(&pdev->dev, "otg");
+	if (IS_ERR(otg_clk)) {
+		dev_err(&pdev->dev, "Failed to get otg clock\n");
+		return PTR_ERR(otg_clk);
+	}
+
+	err = clk_enable(otg_clk);
+	if (err) {
+		clk_put(otg_clk);
+		return err;
+	}
+
+	if (readl(S5PV210_USB_PHY_CON) & (0x1<<1)) {
+		clk_disable(otg_clk);
+		clk_put(otg_clk);
+		return 0;
+	}
+
+	__raw_writel(__raw_readl(S5PV210_USB_PHY_CON) | (0x1<<1),
+			S5PV210_USB_PHY_CON);
+	__raw_writel((__raw_readl(S3C_PHYPWR)
+				& ~(0x1<<7) & ~(0x1<<6)) | (0x1<<8) | (0x1<<5) | (0x1<<4),
+			S3C_PHYPWR);
+	__raw_writel((__raw_readl(S3C_PHYCLK) & ~(0x1<<7)) | (0x3<<0),
+			S3C_PHYCLK);
+	__raw_writel((__raw_readl(S3C_RSTCON)) | (0x1<<4) | (0x1<<3),
+			S3C_RSTCON);
+	__raw_writel(__raw_readl(S3C_RSTCON) & ~(0x1<<4) & ~(0x1<<3),
+			S3C_RSTCON);
+	/* "at least 10uS" for PHY reset elsewhere, 20 not enough here... */
+	udelay(50);
+
+	clk_disable(otg_clk);
+	clk_put(otg_clk);
+
+	return 0;
+}
+
+
+int s5p_usb_phy_exit(struct platform_device *pdev, int type)
+{
+	if (type != S5P_USB_PHY_HOST)
+		return -EINVAL;
+
+	__raw_writel(__raw_readl(S3C_PHYPWR) | (0x1<<7)|(0x1<<6),
+			S3C_PHYPWR);
+	__raw_writel(__raw_readl(S5PV210_USB_PHY_CON) & ~(1<<1),
+			S5PV210_USB_PHY_CON);
+
+	return 0;
+}
+
+六 内核配置项修改
+
+这时，执行make menuconfig配置，在Device Drivers  --->USB support 下看不到OHCI HCD support，只能看到EHCI HCD support，这是因为内核配置存在关联关系，现在解决这个问题。
+
+（1）切换到目录drivers/usb/，打开Kconfig，在USB_ARCH_HAS_OHCI模块下添加如下内容
+
+default y if PLAT_S5P
+
+（2）切换到目录drivers/usb/host下，打开Kconfig，在USB_EHCI_S5P模块下添加如下内容：
+
+select S5P_DEV_USB_EHCI
+
+然后再USB_OHCI_S5P模块下添加如下内容：
+
+select S5P_DEV_USB_OHCI
+
+到这里，执行make menuconfig，到USB相关部分开始OHCI和EHCI中S5P相关，然后编译内核即可正式支持S5PV210内核了。
+
+七 EHCI模块内核bug修改
+
+到这里虽然已经编译 通过了，下载到开发板也可以看到OHCI和EHCI模块都被驱动起来了，插入U盘时也可以正常访问U盘里的数据了，但是，你会发现，如果你对内核U盘中的内容稍作修改然后卸载U盘的话就会发生错误，而且U盘中也没有存入任何数据，这说明，上面的配置仅支持了U盘的读取，还无法支持写操作。
+
+由于芯片手册上对USB HOST部分，我对各寄存器的功能也不是很了解，另外，想了解各部分的功能还需要阅读USB1.0、USB1.1和USB2.0协议，如果想支持USB3.0，还需要阅读相关协议，我暂时还没有时间和精力来阅读这些资料，于是，我去三星的邮件列表中查找，找到了相关问题的解决方法。
+
+打开ehci-s5p.c，然后找到注释
+
+/* DMA burst Enable */
+
+一共有两处，分别将其下的一行代码：
+
+writel(EHCI_INSNREG00_ENABLE_DMA_BURST, EHCI_INSNREG00(hcd->regs));
+
+改为：
+
+writel(0x000E0000, hcd->regs + 0x90);
+writel(0x00400040, hcd->regs + 0x94);
+
+这样，就解决了U盘卸载时出错的问题。
